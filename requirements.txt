@@ -1,2 +1,343 @@
 streamlit==1.53.1
 openai==2.16.0
+
+
+
+
+
+# Windows PowerShell
+# setx OPENAI_API_KEY "너의키"
+
+# macOS/Linux
+# export OPENAI_API_KEY=
+# db.py
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime
+
+DB_PATH = "coaching_note.db"
+
+@contextmanager
+def get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA foreign_keys = ON;")
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+def init_db():
+    with get_conn() as conn:
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS players (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            position TEXT,
+            note TEXT,
+            created_at TEXT NOT NULL
+        );
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS player_status (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_id INTEGER NOT NULL,
+            date TEXT NOT NULL,
+            condition TEXT,           -- 컨디션(좋음/보통/나쁨 등)
+            injury_part TEXT,         -- 부상부위
+            injury_stage TEXT,        -- 회복단계
+            tournament_played INTEGER, -- 0/1
+            memo TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE CASCADE
+        );
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS training_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL,
+            weekday TEXT,
+            intensity TEXT,           -- low/medium/high
+            content TEXT NOT NULL,    -- 훈련내용
+            created_at TEXT NOT NULL
+        );
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS ai_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            cautions TEXT NOT NULL,
+            parent_message TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        """)
+
+def now_iso():
+    return datetime.now().isoformat(timespec="seconds")
+
+def add_player(name: str, position: str = "", note: str = ""):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO players(name, position, note, created_at) VALUES(?,?,?,?)",
+            (name, position, note, now_iso())
+        )
+
+def list_players():
+    with get_conn() as conn:
+        cur = conn.execute("SELECT id, name, position, note, created_at FROM players ORDER BY id DESC")
+        return cur.fetchall()
+
+def add_player_status(player_id: int, date: str, condition: str, injury_part: str, injury_stage: str,
+                      tournament_played: bool, memo: str):
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO player_status(player_id, date, condition, injury_part, injury_stage, tournament_played, memo, created_at)
+            VALUES(?,?,?,?,?,?,?,?)
+        """, (player_id, date, condition, injury_part, injury_stage, int(tournament_played), memo, now_iso()))
+
+def list_player_status(date: str):
+    with get_conn() as conn:
+        cur = conn.execute("""
+            SELECT ps.id, p.name, ps.condition, ps.injury_part, ps.injury_stage, ps.tournament_played, ps.memo
+            FROM player_status ps
+            JOIN players p ON p.id = ps.player_id
+            WHERE ps.date = ?
+            ORDER BY ps.id DESC
+        """, (date,))
+        return cur.fetchall()
+
+def add_training_log(date: str, weekday: str, intensity: str, content: str):
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO training_logs(date, weekday, intensity, content, created_at)
+            VALUES(?,?,?,?,?)
+        """, (date, weekday, intensity, content, now_iso()))
+
+def list_training_logs(date: str):
+    with get_conn() as conn:
+        cur = conn.execute("""
+            SELECT id, weekday, intensity, content, created_at
+            FROM training_logs
+            WHERE date = ?
+            ORDER BY id DESC
+        """, (date,))
+        return cur.fetchall()
+
+def save_ai_report(date: str, summary: str, cautions: str, parent_message: str):
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO ai_reports(date, summary, cautions, parent_message, created_at)
+            VALUES(?,?,?,?,?)
+        """, (date, summary, cautions, parent_message, now_iso()))
+
+def get_latest_ai_report(date: str):
+    with get_conn() as conn:
+        cur = conn.execute("""
+            SELECT summary, cautions, parent_message, created_at
+            FROM ai_reports
+            WHERE date = ?
+            ORDER BY id DESC
+            LIMIT 1
+        """, (date,))
+        return cur.fetchone()
+# app.py
+import os
+import streamlit as st
+import pandas as pd
+from datetime import date
+from db import (
+    init_db, add_player, list_players,
+    add_player_status, list_player_status,
+    add_training_log, list_training_logs,
+    save_ai_report, get_latest_ai_report
+)
+
+# (선택) OpenAI 사용
+def ai_generate(summary_input: str) -> dict:
+    """
+    OpenAI 키 없으면 규칙 기반 요약으로 대체.
+    반환: {"summary":..., "cautions":..., "parent_message":...}
+    """
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        # 규칙 기반(간단) 대체
+        lines = [x.strip() for x in summary_input.split("\n") if x.strip()]
+        short = " / ".join(lines[:3]) if lines else "오늘 기록이 비어있습니다."
+        cautions = "부상/컨디션 이슈 선수는 강도 조절 및 접촉 최소화."
+        parent = f"오늘 훈련은 {short} 중심으로 진행했습니다. 컨디션에 따라 강도는 조절했고, 회복 관리도 함께 했습니다."
+        return {"summary": short, "cautions": cautions, "parent_message": parent}
+
+    # OpenAI 라이브러리(1.x) 기준
+    from openai import OpenAI
+    client = OpenAI(api_key=api_key)
+
+    prompt = f"""
+너는 유소년 스포츠 지도자 보조 코치다.
+아래는 오늘 훈련 기록과 선수 컨디션/부상 정보다.
+1) 훈련 요약(2~4문장)
+2) 훈련 시 주의사항(불릿 3개 이내)
+3) 보호자 공유용 요약(쉬운 문장, 2~3문장, 전문용어 최소화)
+형식은 JSON으로만 출력해라: {{"summary":"", "cautions":"", "parent_message":""}}
+
+[입력]
+{summary_input}
+""".strip()
+
+    resp = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.4
+    )
+    text = resp.choices[0].message.content.strip()
+
+    # JSON 파싱(깨지는 경우 대비)
+    import json
+    try:
+        data = json.loads(text)
+        return {
+            "summary": str(data.get("summary", "")).strip(),
+            "cautions": str(data.get("cautions", "")).strip(),
+            "parent_message": str(data.get("parent_message", "")).strip(),
+        }
+    except Exception:
+        # 파싱 실패 시 안전 처리
+        return {
+            "summary": text[:4000],
+            "cautions": "AI 출력 파싱 실패: 원문 참고",
+            "parent_message": "보호자 공유 문장 생성 실패: 원문 참고"
+        }
+
+def build_input_blob(selected_date: str, trainings, statuses) -> str:
+    t_txt = "\n".join([f"- ({w}/{i}) {c}" for (_, w, i, c, _) in trainings]) if trainings else "- 없음"
+    s_txt = "\n".join([f"- {name}: 컨디션={cond}, 부상={inj_part}/{inj_stage}, 대회참가={bool(tp)}, 메모={memo}"
+                       for (_, name, cond, inj_part, inj_stage, tp, memo) in statuses]) if statuses else "- 없음"
+    return f"날짜: {selected_date}\n\n[훈련 기록]\n{t_txt}\n\n[선수 상태]\n{s_txt}"
+
+# ---- UI ----
+st.set_page_config(page_title="AI 코칭노트 MVP", layout="wide")
+init_db()
+
+st.title("AI 코칭노트 MVP")
+
+tab1, tab2, tab3, tab4 = st.tabs(["선수 등록", "선수 상태", "훈련 기록", "AI 요약/보호자 공유"])
+
+with tab1:
+    st.subheader("선수 등록")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        name = st.text_input("이름", placeholder="예: 김철수")
+    with c2:
+        position = st.text_input("포지션(선택)", placeholder="예: G/F/C")
+    with c3:
+        note = st.text_input("메모(선택)", placeholder="예: 왼손 약함")
+    if st.button("선수 추가"):
+        if name.strip():
+            add_player(name.strip(), position.strip(), note.strip())
+            st.success("추가 완료")
+        else:
+            st.warning("이름은 필수")
+
+    st.divider()
+    players = list_players()
+    if players:
+        df = pd.DataFrame(players, columns=["id", "name", "position", "note", "created_at"])
+        st.dataframe(df, use_container_width=True)
+    else:
+        st.info("등록된 선수가 없습니다.")
+
+with tab2:
+    st.subheader("선수 상태 기록(부상/컨디션)")
+    players = list_players()
+    if not players:
+        st.warning("선수부터 등록하세요.")
+    else:
+        selected_date = st.date_input("날짜", value=date.today()).isoformat()
+        player_map = {f"{p[1]} (#{p[0]})": p[0] for p in players}
+        who = st.selectbox("선수 선택", list(player_map.keys()))
+        condition = st.selectbox("컨디션", ["좋음", "보통", "나쁨", "피곤함", "회복중"])
+        injury_part = st.text_input("부상 부위(없으면 공란)", placeholder="예: 발목")
+        injury_stage = st.text_input("회복 단계(없으면 공란)", placeholder="예: 통증있음/가벼운러닝가능")
+        tournament_played = st.checkbox("최근 대회 참가(또는 경기 출전)")
+        memo = st.text_area("메모", height=80, placeholder="예: 접촉 최소화, 점프/착지 제한")
+        if st.button("상태 저장"):
+            add_player_status(
+                player_id=player_map[who],
+                date=selected_date,
+                condition=condition,
+                injury_part=injury_part.strip(),
+                injury_stage=injury_stage.strip(),
+                tournament_played=tournament_played,
+                memo=memo.strip()
+            )
+            st.success("저장 완료")
+
+        st.divider()
+        st.caption("선택 날짜 기록")
+        rows = list_player_status(selected_date)
+        if rows:
+            df = pd.DataFrame(rows, columns=["id", "name", "condition", "injury_part", "injury_stage", "tournament_played", "memo"])
+            st.dataframe(df, use_container_width=True)
+        else:
+            st.info("해당 날짜 기록이 없습니다.")
+
+with tab3:
+    st.subheader("훈련 기록")
+    selected_date = st.date_input("날짜", value=date.today(), key="train_date").isoformat()
+    weekday = st.selectbox("요일", ["월","화","수","목","금","토","일"])
+    intensity = st.selectbox("훈련 강도", ["low", "medium", "high"])
+    content = st.text_area("훈련 내용", height=120, placeholder="예: 워밍업-드리블-하프코트 스킬-콘드릴-게임")
+    if st.button("훈련 저장"):
+        if content.strip():
+            add_training_log(selected_date, weekday, intensity, content.strip())
+            st.success("저장 완료")
+        else:
+            st.warning("훈련 내용은 필수")
+
+    st.divider()
+    st.caption("선택 날짜 훈련 기록")
+    rows = list_training_logs(selected_date)
+    if rows:
+        df = pd.DataFrame(rows, columns=["id", "weekday", "intensity", "content", "created_at"])
+        st.dataframe(df, use_container_width=True)
+    else:
+        st.info("해당 날짜 훈련 기록이 없습니다.")
+
+with tab4:
+    st.subheader("AI 요약 + 보호자 공유")
+    selected_date = st.date_input("날짜", value=date.today(), key="ai_date").isoformat()
+
+    trainings = list_training_logs(selected_date)
+    statuses = list_player_status(selected_date)
+
+    input_blob = build_input_blob(selected_date, trainings, statuses)
+
+    st.caption("AI 입력(자동 생성)")
+    st.text_area("Input Data", value=input_blob, height=220)
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        if st.button("AI 리포트 생성"):
+            result = ai_generate(input_blob)
+            save_ai_report(selected_date, result["summary"], result["cautions"], result["parent_message"])
+            st.success("리포트 저장 완료")
+    with c2:
+        st.info("OPENAI_API_KEY가 없으면 자동으로 로컬 요약으로 대체됩니다.")
+
+    st.divider()
+    latest = get_latest_ai_report(selected_date)
+    if latest:
+        summary, cautions, parent_msg, created_at = latest
+        st.markdown("### 결과/출력")
+        st.write("**훈련 요약**")
+        st.write(summary)
+
+        st.write("**주의사항**")
+        st.write(cautions)
+
+        st.write("**보호자 공유용 텍스트**")
+        st.code(parent_msg, language="text")
+        st.caption(f"생성 시각: {created_at}")
+    else:
+        st.info("아직 생성된 리포트가 없습니다.")
+
