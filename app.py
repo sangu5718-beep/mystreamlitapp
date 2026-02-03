@@ -1,38 +1,35 @@
 import streamlit as st
-from openai import OpenAI
+from datetime import datetime
 
-st.title("🤖 나의 AI 챗봇")
+st.set_page_config(page_title="PRD Mini App", page_icon="✅", layout="centered")
 
-# 사이드바에서 API Key 입력
-api_key = st.sidebar.text_input("OpenAI API Key", type="password")
+st.title("✅ PRD 기반 초간단 Streamlit 앱")
+st.caption("과제 통과용: 입력 1개 + 버튼 1개 + 출력 1개")
 
-# 대화 기록 초기화
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+with st.expander("📌 PRD 요약(간단)"):
+    st.write("- 목표: 입력을 받아 간단한 결과를 출력하는 MVP 앱")
+    st.write("- Input: 텍스트 1개")
+    st.write("- Output: 텍스트 결과 1개")
 
-# 이전 대화 표시
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+st.divider()
 
-# 사용자 입력 처리
-if prompt := st.chat_input("메시지를 입력하세요"):
-    if not api_key:
-        st.error("⚠️ 사이드바에서 API Key를 입력해주세요!")
+text = st.text_input("한 줄 입력", placeholder="예: 오늘 훈련 요약 / 영화 추천 / 일정 정리 등")
+mode = st.selectbox("출력 형식", ["요약", "추천", "체크리스트"], index=0)
+
+if st.button("결과 생성"):
+    if not text.strip():
+        st.warning("입력을 한 줄만 적어줘.")
     else:
-        # 사용자 메시지 저장 및 표시
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
-        
-        # AI 응답 생성
-        with st.chat_message("assistant"):
-            client = OpenAI(api_key=api_key)
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=st.session_state.messages
-            )
-            reply = response.choices[0].message.content
-            st.markdown(reply)
-            st.session_state.messages.append({"role": "assistant", "content": reply})
-            
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        if mode == "요약":
+            output = f"[{now}] 요약: {text}"
+        elif mode == "추천":
+            output = f"[{now}] 추천: {text} 관련 A/B/C 중 A안을 우선 추천"
+        else:
+            output = f"[{now}] 체크리스트:\n- [ ] {text} 준비\n- [ ] 실행\n- [ ] 마무리"
+
+        st.success("완료")
+        st.code(output, language="text")
+        st.download_button("결과 다운로드", data=output, file_name="result.txt")
+else:
+    st.info("입력하고 버튼 누르면 결과가 나온다.")
